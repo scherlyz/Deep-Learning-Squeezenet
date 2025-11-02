@@ -5,13 +5,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 import numpy as np
-import matplotlib.pyplot as plt
+from sklearn.preprocessing import label_binarize
 
 # === KONFIGURASI ===
-DATA_DIR = "all_data"
-WORK_DIR = "dataset_split"
+DATA_DIR = "all_data"   # folder utama dataset kamu
+WORK_DIR = "dataset_split"  # folder hasil split otomatis
 IMG_SIZE = 224
 BATCH_SIZE = 16
 EPOCHS = 10
@@ -20,13 +20,18 @@ VAL_SPLIT = 0.2
 TEST_SPLIT = 0.2
 SEED = 42
 
+# Buat reproducible
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
 # === CEK DATASET ===
+if not os.path.exists(DATA_DIR):
+    raise FileNotFoundError(f"Folder {DATA_DIR} tidak ditemukan!")
+
 classes = [d for d in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, d))]
 print("Kelas ditemukan:", classes)
 
+# Kumpulkan semua path dan label
 all_paths, all_labels = [], []
 for c in classes:
     folder = os.path.join(DATA_DIR, c)
@@ -81,12 +86,16 @@ val_test_transform = transforms.Compose([
 # === DATASET & DATALOADER ===
 train_dataset = datasets.ImageFolder(os.path.join(WORK_DIR, "train"), transform=train_transform)
 val_dataset = datasets.ImageFolder(os.path.join(WORK_DIR, "val"), transform=val_test_transform)
+test_dataset = datasets.ImageFolder(os.path.join(WORK_DIR, "test"), transform=val_test_transform)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-# === MODEL ===
+# === MODEL: SqueezeNet ===
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Menggunakan device:", device)
+
 num_classes = len(train_dataset.classes)
 model = models.squeezenet1_1(pretrained=True)
 model.classifier = nn.Sequential(
@@ -95,19 +104,19 @@ model.classifier = nn.Sequential(
     nn.ReLU(inplace=True),
     nn.AdaptiveAvgPool2d((1, 1))
 )
+model.num_classes = num_classes
 model = model.to(device)
 
+# === LOSS & OPTIMIZER ===
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-# === TRAINING LOOP ===
-train_losses, val_losses = [], []
-train_accs, val_accs = [], []
-
+# === TRAINING ===
 print("\nMulai training...\n")
+start_train = time.time()
 for epoch in range(EPOCHS):
     model.train()
-    train_loss, correct, total = 0, 0, 0
+    total_loss, preds_list, labels_list = 0, [], []
     for xb, yb in train_loader:
         xb, yb = xb.to(device), yb.to(device)
         optimizer.zero_grad()
@@ -115,58 +124,49 @@ for epoch in range(EPOCHS):
         loss = criterion(out, yb)
         loss.backward()
         optimizer.step()
-        train_loss += loss.item()
-        correct += (out.argmax(1) == yb).sum().item()
-        total += yb.size(0)
-    train_acc = correct / total
-    train_losses.append(train_loss / len(train_loader))
-    train_accs.append(train_acc)
+        total_loss += loss.item() * xb.size(0)
+        preds_list += out.argmax(1).cpu().numpy().tolist()
+        labels_list += yb.cpu().numpy().tolist()
+    train_acc = accuracy_score(labels_list, preds_list)
+    print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {total_loss/len(train_dataset):.4f} | Acc: {train_acc:.4f}")
 
-    # === VALIDASI ===
-    model.eval()
-    val_loss, val_correct, val_total = 0, 0, 0
-    with torch.no_grad():
-        for xb, yb in val_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            out = model(xb).view(xb.size(0), -1)
-            loss = criterion(out, yb)
-            val_loss += loss.item()
-            val_correct += (out.argmax(1) == yb).sum().item()
-            val_total += yb.size(0)
-    val_acc = val_correct / val_total
-    val_losses.append(val_loss / len(val_loader))
-    val_accs.append(val_acc)
+print(f"\nWaktu training: {time.time()-start_train:.2f} detik")
 
-    print(f"Epoch [{epoch+1}/{EPOCHS}]  Train Loss: {train_losses[-1]:.4f} | Val Loss: {val_losses[-1]:.4f} | "
-          f"Train Acc: {train_accs[-1]:.4f} | Val Acc: {val_accs[-1]:.4f}")
+# === TESTING ===
+print("\nEvaluasi pada data testing...\n")
+start_test = time.time()
+model.eval()
+y_true, y_pred, y_score = [], [], []
+with torch.no_grad():
+    for xb, yb in test_loader:
+        xb = xb.to(device)
+        out = model(xb).view(xb.size(0), -1)
+        probs = torch.nn.functional.softmax(out, dim=1).cpu().numpy()
+        preds = probs.argmax(axis=1)
+        y_true += yb.numpy().tolist()
+        y_pred += preds.tolist()
+        y_score += probs.tolist()
+test_time = time.time() - start_test
 
-# === VISUALISASI ===
-epochs = np.arange(1, EPOCHS + 1)
-plt.figure(figsize=(10, 4))
+# === METRIK ===
+acc = accuracy_score(y_true, y_pred)
+prec = precision_score(y_true, y_pred, average="macro", zero_division=0)
+rec = recall_score(y_true, y_pred, average="macro", zero_division=0)
+f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+try:
+    y_true_bin = label_binarize(y_true, classes=list(range(num_classes)))
+    roc_auc = roc_auc_score(y_true_bin, np.array(y_score), average="macro", multi_class="ovo")
+except Exception:
+    roc_auc = float("nan")
 
-# Grafik Akurasi
-plt.subplot(1, 2, 1)
-plt.plot(epochs, train_accs, label="Train Accuracy", marker='o')
-plt.plot(epochs, val_accs, label="Validation Accuracy", marker='s')
-plt.title("Perbandingan Akurasi")
-plt.xlabel("Epoch")
-plt.ylabel("Accuracy")
-plt.legend()
-plt.grid(True)
+print("=== HASIL TESTING ===")
+print(f"Akurasi      : {acc:.4f}")
+print(f"Presisi (macro): {prec:.4f}")
+print(f"Recall (macro) : {rec:.4f}")
+print(f"F1-Score (macro): {f1:.4f}")
+print(f"ROC/AUC        : {roc_auc:.4f}")
+print(f"Waktu Testing  : {test_time:.2f} detik")
 
-# Grafik Loss
-plt.subplot(1, 2, 2)
-plt.plot(epochs, train_losses, label="Train Loss", marker='o')
-plt.plot(epochs, val_losses, label="Validation Loss", marker='s')
-plt.title("Perbandingan Loss")
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.legend()
-plt.grid(True)
-
-plt.tight_layout()
-plt.savefig("training_history.png")
-plt.show()
-
-print("\n✅ Grafik training tersimpan di: training_history.png")
+# === SIMPAN MODEL ===
 torch.save(model.state_dict(), "squeezenet_trained.pth")
+print("\nModel tersimpan di: squeezenet_trained.pth")
